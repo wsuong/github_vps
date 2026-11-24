@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+# Codespaces persistence fix: existing Windows installations only.
+
 MODE="${1:-win11}"
 TARGET="${2:-all}"
 
@@ -22,7 +24,7 @@ WINDOWS_DISK2_SIZE="${WINDOWS_DISK2_SIZE:-10G}"
 
 UBUNTU_ROOT_PASSWORD="${ROOT_PASSWORD:-root}"
 
-CURRENT_DIR="$(pwd)"
+CURRENT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 WINDOWS_PATH="$CURRENT_DIR/$WINDOWS_DIR"
 UBUNTU_PATH="$CURRENT_DIR/$UBUNTU_DIR"
@@ -98,12 +100,27 @@ detect_large_storage() {
 }
 
 prepare_windows_storage() {
-    detect_large_storage
+    # Keep the existing migrated system disk outside the Git repository.
+    TARGET_MOUNT="/workspaces"
+    WINDOWS_STORAGE_PATH="/workspaces/windows-persistent"
 
-    WINDOWS_STORAGE_PATH="$TARGET_MOUNT/$WINDOWS_STORAGE_SUBDIR"
+    if [ ! -d /workspaces ]; then
+        echo "错误：此版本面向 Codespaces，需要 /workspaces 持久目录。"
+        exit 1
+    fi
     mkdir -p "$WINDOWS_STORAGE_PATH"
+    if [ ! -w "$WINDOWS_STORAGE_PATH" ]; then
+        echo "错误：存储目录不可写：$WINDOWS_STORAGE_PATH"
+        exit 1
+    fi
+    TARGET_DEV="$(df -P "$WINDOWS_STORAGE_PATH" | awk 'NR==2{print $1}')"
 
-    echo "📂 Windows Storage 路径: $WINDOWS_STORAGE_PATH"
+    if [ ! -s "$WINDOWS_STORAGE_PATH/data.img" ]; then
+        echo "错误：未找到已有系统盘：$WINDOWS_STORAGE_PATH/data.img"
+        echo "为防止意外重新安装，已停止。请先迁移或恢复原系统磁盘。"
+        exit 1
+    fi
+    echo "Windows 持久存储：$WINDOWS_STORAGE_PATH"
 }
 
 prepare_ubuntu_storage() {
@@ -121,7 +138,20 @@ start_windows() {
     mkdir -p "$WINDOWS_PATH"
 
     prepare_windows_storage
-    backup_file "$WINDOWS_COMPOSE_FILE"
+    # Reuse the existing config to retain credentials and machine settings.
+    if [ -f "$WINDOWS_COMPOSE_FILE" ]; then
+        if ! grep -Eq '^[[:space:]]*-[[:space:]]*["\x27]?/workspaces/windows-persistent:/storage["\x27]?[[:space:]]*$' "$WINDOWS_COMPOSE_FILE"; then
+            echo "错误：现有 Compose 未使用 /workspaces/windows-persistent:/storage。"
+            echo "为避免切换到错误磁盘，未修改配置。请先检查 $WINDOWS_COMPOSE_FILE"
+            exit 1
+        fi
+        detect_compose_cmd
+        $COMPOSE_CMD -f "$WINDOWS_COMPOSE_FILE" config --quiet
+        df -h "$WINDOWS_STORAGE_PATH"
+        $COMPOSE_CMD -f "$WINDOWS_COMPOSE_FILE" up -d
+        echo "Windows 容器已启动，请等待系统开机。"
+        return
+    fi
 
     AVAIL_GB=$(df -P "$TARGET_MOUNT" | awk 'NR==2{print int($4/1024/1024)}')
     echo "   可用空间: ${AVAIL_GB}G"
@@ -131,7 +161,7 @@ start_windows() {
     if [ "$AVAIL_GB" -lt "$TOTAL_NEEDED" ]; then
         echo ""
         echo "⚠️  警告: 可用空间仅 ${AVAIL_GB}G，但虚拟磁盘配置了 ${TOTAL_NEEDED}G"
-        echo "    qcow2 是稀疏格式，实际占用取决于 Windows 内部写入量"
+        echo "    虚拟磁盘可能是稀疏文件，实际占用取决于 Windows 内部写入量"
         echo "    如果 Windows 内部使用超过 ${AVAIL_GB}G，磁盘将会写满"
         echo ""
     fi
@@ -171,14 +201,14 @@ EOF
     echo "🚀 执行: $COMPOSE_CMD -f $WINDOWS_COMPOSE_FILE up"
     echo ""
 
-    $COMPOSE_CMD -f "$WINDOWS_COMPOSE_FILE" up
+    $COMPOSE_CMD -f "$WINDOWS_COMPOSE_FILE" up -d
 
     echo ""
     echo "🎉 启动完成"
     echo "   管理界面: http://localhost:8006"
     echo "   RDP 连接: localhost:3389"
     echo "   用户名: ${WINDOWS_USERNAME}"
-    echo "   密码: ${WINDOWS_PASSWORD}"
+    echo "   密码: 使用现有 Windows 登录密码（此处不显示）"
     echo "   配置目录: $WINDOWS_PATH"
     echo "   数据存储: $WINDOWS_STORAGE_PATH"
     echo "   宿主机设备: $TARGET_DEV"
@@ -322,17 +352,12 @@ EOF
 }
 
 stop_windows() {
-    echo "🛑 停止 Windows 容器..."
-
-    if [ -f "$WINDOWS_COMPOSE_FILE" ]; then
-        detect_compose_cmd
-        $COMPOSE_CMD -f "$WINDOWS_COMPOSE_FILE" down 2>/dev/null || true
+    echo "停止 Windows 容器（保留容器和系统磁盘）..."
+    if docker container inspect windows >/dev/null 2>&1; then
+        docker stop --timeout 120 windows
+    else
+        echo "未找到 windows 容器，无需停止。"
     fi
-
-    docker stop windows 2>/dev/null || true
-    docker rm windows 2>/dev/null || true
-
-    echo "✅ Windows 容器已停止"
 }
 
 stop_ubuntu() {
@@ -387,7 +412,7 @@ show_usage() {
     echo "  Ubuntu 配置目录: ./ubuntu"
     echo ""
     echo "数据目录:"
-    echo "  Windows 数据目录: 大容量盘/windows/docker-windows-storage"
+    echo "  Windows 数据目录: /workspaces/windows-persistent（必须已有 data.img）"
     echo "  Ubuntu 数据目录: 大容量盘/ubuntu/ubuntu-data"
     echo ""
     echo "环境变量:"
